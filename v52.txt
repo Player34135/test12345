@@ -12,6 +12,20 @@
 -- - attachKfsExecHandler и attachVictimKfsHandler делят общий wait-helper.
 --
 -- CHANGELOG (последние версии):
+-- [V7.92 SCOPE PHASE 5+] Полировка: задействован неиспользованный Scope API.
+--                 (1) watchVictimAnimator в C00lkidd теперь создаёт per-victim scope
+--                 (_c00Scope:Child("victim_<name>")) + scope:BindToInstance(victimModel).
+--                 Когда жертва уничтожена игрой — scope умирает автоматически (раньше
+--                 коннекты Humanoid wait + AnimationPlayed копились dead в _c00Scope до
+--                 конца сессии; за раунд = десятки мёртвых записей × 2). _victimScopes —
+--                 weak-keyed map для лукапа при рекурсивном вызове (ветка А wait-Humanoid).
+--                 (2) SlasherBeatVisual.start теперь использует _beatScope:BindToRenderStep
+--                 вместо ручного RunService:Bind + _bound флаг + ручной Unbind в stop().
+--                 _bound и _watcherConns переменные удалены — лайфцикл RenderStep управляется
+--                 через scope-cleanup-функцию автоматически. Test-кнопка SlasherBeatVisual.
+--                 testBeat (свой TEST_BIND с custom-логикой "перебить предыдущий тест")
+--                 НЕ тронута — переписывание потребовало бы test-scope иерархии, риск/польза
+--                 не оправдывает.
 -- [V7.92 SCOPE PHASE 5] Финал миграции на Scope. Все 4 legacy-массива
 --                 (_connections, _lmsConnections, _vlConns, _killerSkinInfo) удалены
 --                 из объявлений. Связанные с ними циклы убраны: deactivateLMSSfx,
@@ -2563,18 +2577,38 @@ do
         task.delay(5, function() _victimExecRunning[victimModel] = nil end)
     end
 
+    -- 👽 V7.92 SCOPE PHASE 5+: per-victim scope с BindToInstance.
+    -- Раньше watchVictimAnimator клал коннекты (Humanoid wait + AnimationPlayed) прямо в
+    -- _c00Scope (инит-уровень). Жертв за раунд десятки — когда жертва умирала, её
+    -- коннекты становились dead в _c00Scope как мусор до конца сессии.
+    -- Теперь: каждая жертва получает _c00Scope:Child("victim_<name>") + BindToInstance,
+    -- который через :Connect(victim.Destroying, scope.Destroy) автоматически чистит scope
+    -- когда жертва уничтожена игрой. _victimScopes — weak-keyed map для лукапа существующего
+    -- scope при рекурсивном вызове (когда ветка А wait-Humanoid снова зовёт watchVictimAnimator).
+    -- weak-keys чтобы entry не держал victimModel в жизни (та может быть уничтожена игрой).
+    local _victimScopes = setmetatable({}, {__mode = "k"})
+
     local function watchVictimAnimator(victimModel)
+        -- Получаем существующий scope или создаём новый. Рекурсивный вызов после wait-Humanoid
+        -- попадёт сюда повторно и переиспользует уже-созданный scope.
+        local vScope = _victimScopes[victimModel]
+        if not vScope then
+            vScope = _c00Scope:Child("victim_" .. victimModel.Name)
+            vScope:BindToInstance(victimModel)
+            _victimScopes[victimModel] = vScope
+            -- Cleanup-функция: убираем себя из _victimScopes при destroy (иначе при
+            -- рекурсивном вызове после смерти жертвы _victimScopes[vm] вернёт dead-scope,
+            -- любой :Add на нём моментально cleanup'нется и потеряется).
+            vScope:Cleanup(function() _victimScopes[victimModel] = nil end)
+        end
+
         local vh = victimModel:FindFirstChildOfClass("Humanoid")
         if not vh then
-            -- 👽 V7.92 SCOPE PHASE 3: Once-паттерн от Scope:Once мог бы тут пригодиться
-            -- (FIX 2 — гонка между присваиванием conn и срабатыванием Connect), но в
-            -- данном случае Humanoid появляется через :ChildAdded асинхронно — никаких
-            -- синхронных стрельб. Оставляю исходный self-disconnect.
             local conn
             conn = victimModel.ChildAdded:Connect(function(c)
                 if c:IsA("Humanoid") then conn:Disconnect(); task.wait(0.1); watchVictimAnimator(victimModel) end
             end)
-            _c00Scope:Add(conn); return
+            vScope:Add(conn); return
         end
         local va = vh:FindFirstChildOfClass("Animator")
         if not va then va = Instance.new("Animator"); va.Parent = vh end
@@ -2597,7 +2631,7 @@ do
             if d:IsA("Motor6D") then motorDefaults[d] = {C0 = d.C0, C1 = d.C1} end
         end
         local vRep = {}
-        _c00Scope:Connect(va.AnimationPlayed, function(trk)
+        vScope:Connect(va.AnimationPlayed, function(trk)
             if not trk.Animation then return end
             local raw = tostring(trk.Animation.AnimationId or ""):match("%d+")
             if not (raw and _activeExecPlayerIds[raw]) then return end
@@ -3146,16 +3180,10 @@ end
     local Lighting = game:GetService("Lighting")
 
     -- ===== СОСТОЯНИЕ =====
-    local _running, _bound = false, false
+    -- 👽 V7.92 SCOPE PHASE 5+: _bound и _watcherConns удалены. RenderStep лайфциклом
+    -- управляет _beatScope:BindToRenderStep, коннекты watchers — _beatScope:Connect.
+    local _running = false
     local _watchedSounds = {}                    -- [Sound] = {window, prev, lastBeat, kind}
-    -- 👽 V7.92 SCOPE PHASE 3: _watcherConns теперь legacy. Реальное хранение коннектов —
-    -- _beatScope. Сам массив оставлен пустым для совместимости с циклом в stop()
-    -- (он остался как no-op для безопасности). В stop() _beatScope:Destroy() + пересоздание
-    -- — это эквивалент старого `_watcherConns:clear`. В отличие от C00lkidd, в этом
-    -- модуле не было никаких глобальных track() — все коннекты уже жили в _watcherConns,
-    -- так что поведенческой разницы нет: stop() как чистил всё, так и чистит. Польза —
-    -- единообразие с остальной Scope-инфраструктурой + FIX 6 для snd.Destroying.
-    local _watcherConns = {}
     local _beatScope = _zorgScope:Child("slasher_beat")
     local _fovDelta, _rollDelta = 0, 0
     local _shakeDelta = 0                        -- импульсный shake (studs forward, затухает)
@@ -3535,27 +3563,22 @@ end
                 if _running and d:IsA("Sound") then attachSound(d) end
             end)
         end
-        RunService:BindToRenderStep(RENDER_BIND_NAME, Enum.RenderPriority.Camera.Value + 1, cameraStep)
-        _bound = true
+        -- 👽 V7.92 SCOPE PHASE 5+: Scope:BindToRenderStep — RunService:Bind + регистрация
+        -- cleanup-функции (UnbindFromRenderStep) в один вызов. Раньше: ручной Bind + флаг
+        -- _bound + ручной Unbind в stop(). Теперь _beatScope:Destroy() сам сделает Unbind.
+        _beatScope:BindToRenderStep(RENDER_BIND_NAME, Enum.RenderPriority.Camera.Value + 1, cameraStep)
         zlog("CFG", "🔪 SlasherBeatVisual STARTED")
     end
 
     function SlasherBeatVisual.stop()
         if not _running then return end
         _running = false
-        if _bound then
-            pcall(function() RunService:UnbindFromRenderStep(RENDER_BIND_NAME) end)
-            _bound = false
-        end
-        -- 👽 V7.92 SCOPE PHASE 3: destroy + пересоздание _beatScope. Это убивает все
-        -- коннекты модуля: DescendantAdded watchers, Once на snd.Destroying (FIX 6).
-        -- В отличие от C00lkidd, в этом модуле track() никогда не использовался — все
-        -- коннекты и раньше жили в _watcherConns, поэтому поведение stop() идентично.
-        -- Цикл по _watcherConns ниже остался legacy-no-op (массив больше не наполняется).
+        -- 👽 V7.92 SCOPE PHASE 5+: _beatScope:Destroy() автоматически делает Unbind
+        -- через cleanup-функцию зарегистрированную в :BindToRenderStep. Флаг _bound
+        -- и ручной UnbindFromRenderStep больше не нужны.
         _beatScope:Destroy()
         _beatScope = _zorgScope:Child("slasher_beat")
-        for _, c in ipairs(_watcherConns) do pcall(function() c:Disconnect() end) end
-        table.clear(_watcherConns); table.clear(_watchedSounds)
+        table.clear(_watchedSounds)
         _fovDelta, _rollDelta, _flashDelta, _chromDelta = 0, 0, 0, 0
         _shakeDelta = 0
         if _colorFX then
